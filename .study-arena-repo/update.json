@@ -1,0 +1,23 @@
+{
+  "version": "1.6.0",
+  "notes": "One-tap updates from GitHub (Settings → Study Arena → Update now).",
+  "files": [
+    "manifest.json",
+    "main.js",
+    "styles.css",
+    "courses/10-math3705-lessons.js",
+    "courses/11-math3705-ch1.js",
+    "courses/12-math3705-fourier-pde.js",
+    "courses/13-math3705-sl-fourier.js",
+    "courses/20-sysc3600.js",
+    "courses/30-ecor3800.js",
+    "courses/40-maae3202.js",
+    "courses/50-maae3300.js",
+    "courses/60-maae3004.js",
+    "courses/65-maae3500.js",
+    "courses/70-mech3700.js",
+    "courses/75-maae3400.js",
+    "tools/build-release.js",
+    "tools/check-course.js"
+  ]
+}
