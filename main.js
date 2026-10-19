@@ -3255,6 +3255,504 @@ function lessonBeats(sec) {
 }
 
 /* ================================================================== */
+/* Exam mode: a randomly generated test over chosen lectures            */
+/* ================================================================== */
+const EXAM_SIZES = [5, 10, 15, 20, 25];
+const EXAM_LEVELS = [
+  { id: 'easy', name: 'Easy', desc: 'Shorter, single-idea questions' },
+  { id: 'standard', name: 'Standard', desc: 'Any question, like the practice pool' },
+  { id: 'hard', name: 'Hard', desc: 'The longest multi-step versions' },
+  { id: 'mixed', name: 'Mixed', desc: 'A spread, like a real exam' },
+];
+const EXAM_TIMES = [0, 20, 30, 45, 60, 90, 120];
+const fmtClock = (s) => { s = Math.max(0, Math.round(s)); const m = Math.floor(s / 60), r = s % 60; return `${m}:${String(r).padStart(2, '0')}`; };
+const shuffle = (a) => { const b = a.slice(); for (let i = b.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [b[i], b[j]] = [b[j], b[i]]; } return b; };
+
+// Pick a question for one slot. Difficulty is judged from the generator's own points
+// (single-step questions carry 5–10 points, long multi-step ones 20–25).
+function examQuestion(topic, level, avoid) {
+  const tries = level === 'standard' ? 3 : 10;
+  const cands = [];
+  for (let k = 0; k < tries; k++) {
+    try { const q = makeQuestion(topic); if (!avoid.has(q.prompt)) cands.push(q); } catch (e) { /* try again */ }
+  }
+  if (!cands.length) return null;
+  if (level === 'easy') { const m = Math.min(...cands.map((q) => q.points)); return pick(cands.filter((q) => q.points === m)); }
+  if (level === 'hard') { const m = Math.max(...cands.map((q) => q.points)); return pick(cands.filter((q) => q.points === m)); }
+  return cands[0];
+}
+
+const TOPIC_WEIGHT = new Map();
+function topicWeight(t) { // typical marks a topic's questions carry (sampled once)
+  if (!TOPIC_WEIGHT.has(t.id)) { let s = 0, k = 0; for (let i = 0; i < 4; i++) { try { s += makeQuestion(t).points; k++; } catch (e) { /* skip */ } } TOPIC_WEIGHT.set(t.id, k ? s / k : 15); }
+  return TOPIC_WEIGHT.get(t.id);
+}
+function buildExam(course, secIds, n, level) {
+  const secs = shuffle(SECTIONS.filter((s) => s.course === course && secIds.includes(s.id) && s.skills.some((id) => topicById(id))));
+  if (!secs.length) return [];
+  // spread the questions across the chosen lectures: every lecture gets one before any gets two
+  const slots = [];
+  for (let i = 0; i < n; i++) slots.push(secs[i % secs.length]);
+  const usedTopics = new Map(), prompts = new Set(), out = [];
+  const levels = level === 'mixed' ? shuffle(Array.from({ length: n }, (_, i) => ['easy', 'standard', 'hard'][i % 3])) : Array(n).fill(level);
+  slots.forEach((sec, i) => {
+    let skills = sec.skills.map(topicById).filter(Boolean);
+    // difficulty also steers which kinds of question a lecture contributes
+    if (levels[i] !== 'standard' && skills.length > 1) {
+      const pts = skills.map(topicWeight), sorted = pts.slice().sort((a, b) => a - b), med = sorted[Math.floor((sorted.length - 1) / 2)];
+      const keep = skills.filter((t, k) => (levels[i] === 'easy' ? pts[k] <= med : pts[k] >= med));
+      if (keep.length) skills = keep;
+    }
+    const fresh = skills.filter((t) => !usedTopics.get(t.id));
+    const t = pick(fresh.length ? fresh : skills);
+    usedTopics.set(t.id, (usedTopics.get(t.id) || 0) + 1);
+    const q = examQuestion(t, levels[i], prompts);
+    if (!q) return;
+    prompts.add(q.prompt);
+    q.examSec = sec.id;
+    out.push({ q, text: '', choice: null, strokes: [], flagged: false, result: null });
+  });
+  // keep each lecture's questions together, in course order, like a printed test
+  const order = SECTIONS.map((s) => s.id);
+  return out.sort((a, b) => order.indexOf(a.q.examSec) - order.indexOf(b.q.examSec));
+}
+
+function examRead(q, txt) {
+  if (q.type === 'set') { const items = parseSet(txt); return { vals: items.map((i) => i.v), tex: items.map((i) => toTex(i.ast)).join(',\\ ') }; }
+  if (!(q.vars || []).length) txt = txt.replace(/\$/g, '').replace(/(\d),(?=\d{3}(?!\d))/g, '$1').replace(/%\s*$/, '');
+  const ast = parse(txt, q.vars);
+  return { ast, tex: toTex(ast) };
+}
+
+function gradeItem(it) {
+  const q = it.q;
+  if (q.type === 'choice') {
+    if (it.choice == null) return { blank: true, correct: false };
+    const o = q.options[it.choice];
+    return o.correct ? { correct: true, userRich: o.tex } : { correct: false, userRich: o.tex, mistake: { why: o.why, stepIndex: o.stepIndex } };
+  }
+  const txt = (it.text || '').trim();
+  if (!txt) return { blank: true, correct: false };
+  try {
+    const r = examRead(q, txt);
+    const res = q.type === 'set' ? diagnoseSet(q, r.vals) : diagnose(q, r.ast);
+    return Object.assign({}, res, { userTex: r.tex });
+  } catch (e) {
+    return { correct: false, unreadable: true, userText: txt };
+  }
+}
+
+const ExamMixin = {
+  /* ---------- setup ---------- */
+  openExam() {
+    if (this.exam && this.exam.state === 'running') { this.setMode('exam'); this.renderExamQuestion(); return; }
+    this.setMode('exam');
+    this.renderExamSetup();
+  },
+
+  examPrefs() {
+    const all = this.data.examPrefs || (this.data.examPrefs = {});
+    return all[this.data.course] || (all[this.data.course] = { secs: null, n: 10, level: 'mixed', minutes: 0 });
+  },
+
+  renderExamSetup() {
+    const E = this.examEl;
+    E.innerHTML = '';
+    if (this.examTimer) { clearInterval(this.examTimer); this.examTimer = null; }
+    const course = this.data.course;
+    const pref = this.examPrefs();
+    const secs = SECTIONS.filter((s) => s.course === course && s.skills.some((id) => topicById(id)));
+    const chosen = new Set(pref.secs ? pref.secs.filter((id) => secs.some((s) => s.id === id)) : secs.map((s) => s.id));
+
+    const wrap = h('div', 'sa-exam-setup', E);
+    const head = h('div', 'sa-card sa-exam-head', wrap);
+    h('div', 'sa-learn-kicker', head, course);
+    h('h2', 'sa-learn-title', head, 'Build a practice test');
+    h('div', 'sa-learn-progress', head, 'Every question is generated fresh. Pick the lectures, length and difficulty; you get a mark and full solutions at the end.');
+
+    const grid = h('div', 'sa-exam-grid', wrap);
+    const lec = h('div', 'sa-card sa-exam-lectures', grid);
+    const lh = h('div', 'sa-exam-row-head', lec);
+    h('div', 'sa-exam-label', lh, 'Lectures');
+    const countEl = h('span', 'sa-muted', lh);
+    const tools = h('div', 'sa-lesson-tools', lh);
+    const all = h('button', 'sa-linkbtn', tools, 'All');
+    const none = h('button', 'sa-linkbtn', tools, 'None');
+    const list = h('div', 'sa-exam-seclist', lec);
+    const boxes = [];
+    for (const s of secs) {
+      const row = h('label', 'sa-exam-sec', list);
+      const cb = h('input', '', row);
+      cb.type = 'checkbox'; cb.checked = chosen.has(s.id);
+      h('span', 'sa-nav-num', row, s.num);
+      const tx = h('span', 'sa-exam-sec-text', row);
+      h('span', 'sa-exam-sec-title', tx, s.title);
+      { const nt = s.skills.filter((id) => topicById(id)).length; h('span', 'sa-exam-sec-meta', tx, `${s.tag} · ${nt} question type${nt === 1 ? '' : 's'}`); }
+      cb.addEventListener('change', () => { if (cb.checked) chosen.add(s.id); else chosen.delete(s.id); refresh(); });
+      boxes.push([cb, s]);
+    }
+    all.addEventListener('click', () => { boxes.forEach(([cb, s]) => { cb.checked = true; chosen.add(s.id); }); refresh(); });
+    none.addEventListener('click', () => { boxes.forEach(([cb, s]) => { cb.checked = false; chosen.delete(s.id); }); refresh(); });
+
+    const opt = h('div', 'sa-card sa-exam-options', grid);
+    const seg = (label, items, cur, fmt, onPick) => {
+      h('div', 'sa-exam-label', opt, label);
+      const row = h('div', 'sa-seg', opt);
+      const btns = items.map((v) => { const b = h('button', 'sa-seg-btn', row, fmt(v)); b.addEventListener('click', () => { onPick(v); btns.forEach((x) => x.classList.toggle('is-active', x === b)); refresh(); }); b.classList.toggle('is-active', v === cur || (v && v.id === cur)); return b; });
+      return row;
+    };
+    seg('Questions', EXAM_SIZES, pref.n, (v) => String(v), (v) => { pref.n = v; });
+    seg('Difficulty', EXAM_LEVELS, pref.level, (v) => v.name, (v) => { pref.level = v.id; });
+    const levelDesc = h('div', 'sa-exam-desc', opt);
+    seg('Time limit', EXAM_TIMES, pref.minutes, (v) => (v ? `${v} min` : 'None'), (v) => { pref.minutes = v; });
+    const summary = h('div', 'sa-exam-summary', opt);
+    const startRow = h('div', 'sa-actions', opt);
+    const start = this.button(startRow, 'Start test', () => this.startExam([...chosen], pref), 'mod-cta sa-primary', 'play');
+
+    const refresh = () => {
+      countEl.textContent = `${chosen.size} of ${secs.length} selected`;
+      levelDesc.textContent = EXAM_LEVELS.find((l) => l.id === pref.level).desc + '.';
+      const per = chosen.size ? pref.n / chosen.size : 0;
+      summary.textContent = chosen.size ? `${pref.n} questions over ${chosen.size} lecture${chosen.size > 1 ? 's' : ''} (${per >= 1 ? `about ${Math.round(per * 10) / 10} each` : 'not every lecture fits: add questions or pick fewer lectures'})${pref.minutes ? `, ${pref.minutes} minutes` : ', untimed'}.` : 'Pick at least one lecture.';
+      start.disabled = !chosen.size;
+    };
+    refresh();
+
+    const hist = (this.data.examHistory || []).filter((x) => x.course === course).slice(-6).reverse();
+    if (hist.length) {
+      const hc = h('div', 'sa-card sa-exam-history', wrap);
+      h('div', 'sa-exam-label', hc, 'Recent tests');
+      for (const x of hist) {
+        const row = h('div', 'sa-exam-hist-row', hc);
+        h('span', 'sa-exam-hist-date', row, x.date);
+        h('span', 'sa-exam-hist-detail', row, `${x.n} questions · ${EXAM_LEVELS.find((l) => l.id === x.level)?.name || x.level} · ${x.secs.length} lecture${x.secs.length > 1 ? 's' : ''}`);
+        h('span', 'sa-exam-hist-score' + (x.pct >= 80 ? ' is-good' : x.pct < 50 ? ' is-low' : ''), row, `${x.pct}%`);
+      }
+    }
+    this.contentEl.scrollTop = 0;
+  },
+
+  async startExam(secIds, pref) {
+    await this.plugin.save();
+    const items = buildExam(this.data.course, secIds, pref.n, pref.level);
+    if (!items.length) { new Notice('Could not build a test from those lectures.'); return; }
+    this.exam = { state: 'running', course: this.data.course, secIds, level: pref.level, items, i: 0, started: Date.now(), limit: pref.minutes * 60, submitArmed: false };
+    this.renderExamShell();
+    this.renderExamQuestion();
+    if (this.examTimer) clearInterval(this.examTimer);
+    this.examTimer = setInterval(() => this.tickExam(), 1000);
+  },
+
+  /* ---------- taking the test ---------- */
+  renderExamShell() {
+    const E = this.examEl, X = this.exam;
+    E.innerHTML = '';
+    const bar = h('div', 'sa-card sa-exam-bar', E);
+    const info = h('div', 'sa-exam-bar-info', bar);
+    this.exPos = h('div', 'sa-exam-pos', info);
+    this.exClock = h('div', 'sa-pill sa-exam-clock', info);
+    this.exNav = h('div', 'sa-exam-nav', bar);
+    X.items.forEach((it, k) => {
+      const b = h('button', 'sa-exam-chip', this.exNav, String(k + 1));
+      b.addEventListener('click', () => this.gotoExam(k));
+    });
+    const acts = h('div', 'sa-exam-bar-acts', bar);
+    this.exSubmit = this.button(acts, 'Submit test', () => this.trySubmitExam(), 'mod-cta', 'flag');
+
+    const main = h('div', 'sa-main sa-exam-main', E);
+    const left = h('div', 'sa-left', main);
+    this.exQ = h('div', 'sa-card sa-question', left);
+    const boardCard = h('div', 'sa-card sa-board', left);
+    const tb = h('div', 'sa-toolbar', boardCard);
+    const tools = {};
+    const setTool = (t) => { this.exBoard.tool = t; for (const [k, b] of Object.entries(tools)) b.classList.toggle('is-active', k === t); };
+    tools.pen = this.button(tb, 'Pen', () => setTool('pen'), 'sa-tool', 'pencil');
+    tools.eraser = this.button(tb, 'Eraser', () => setTool('eraser'), 'sa-tool', 'eraser');
+    h('div', 'sa-spacer', tb);
+    this.button(tb, 'Undo', () => this.exBoard.undo(), 'sa-tool', 'undo-2');
+    this.button(tb, 'Clear', () => this.exBoard.clear(), 'sa-tool', 'trash-2');
+    if (this.exBoard) this.exBoard.destroy();
+    this.exBoard = new Board(boardCard, { scrollEl: this.contentEl, penOnly: () => this.data.penOnly });
+    setTool('pen');
+    this.button(h('div', 'sa-more', boardCard), 'More space', () => this.exBoard.addSpace(), 'sa-ghost', 'plus');
+
+    const ans = h('div', 'sa-card sa-answer', left);
+    this.exAnsWrap = ans;
+    const nav = h('div', 'sa-actions sa-exam-move', left);
+    this.exPrev = this.button(nav, 'Previous', () => this.gotoExam(this.exam.i - 1), 'sa-ghost', 'arrow-left');
+    this.exFlag = this.button(nav, 'Flag for review', () => { const it = this.exam.items[this.exam.i]; it.flagged = !it.flagged; this.refreshExamNav(); }, 'sa-ghost', 'bookmark');
+    h('div', 'sa-spacer', nav);
+    this.exNext = this.button(nav, 'Next', () => this.gotoExam(this.exam.i + 1), 'mod-cta', 'arrow-right');
+    this.tickExam();
+  },
+
+  stashExam() {
+    const X = this.exam;
+    if (!X || X.state !== 'running') return;
+    const it = X.items[X.i];
+    if (this.exBoard) { it.strokes = this.exBoard.strokes.slice(); it.boardH = this.exBoard.height; }
+    if (this.exInput) it.text = this.exInput.value;
+  },
+
+  gotoExam(k) {
+    const X = this.exam;
+    if (k < 0 || k >= X.items.length) return;
+    this.stashExam();
+    X.i = k;
+    X.submitArmed = false;
+    this.renderExamQuestion();
+  },
+
+  renderExamQuestion() {
+    const X = this.exam, it = X.items[X.i], q = it.q;
+    VAR_TEX_Q = q.varTex || null;
+    const sec = SECTIONS.find((s) => s.id === q.examSec);
+    const c = this.exQ;
+    c.innerHTML = '';
+    const meta = h('div', 'sa-meta', c);
+    h('span', 'sa-tag', meta, `Q${X.i + 1}`);
+    if (sec) h('span', 'sa-tag sa-tag-soft', meta, `${sec.tag} · ${sec.title}`);
+    h('span', 'sa-tag sa-tag-points', meta, `${q.points} marks`);
+    renderRich(h('div', 'sa-prompt', c), q.prompt);
+    if (q.figure) { try { makeWidget(c, q.figure); } catch (e) { console.error(e); } }
+    h('div', 'sa-hint-line', c, q.hint);
+
+    this.exBoard.reset();
+    this.exBoard.height = it.boardH || 560;
+    this.exBoard.strokes = it.strokes.slice();
+    this.exBoard.resize();
+
+    const A = this.exAnsWrap;
+    A.innerHTML = '';
+    this.exInput = null;
+    if (q.type === 'choice') {
+      const box = h('div', 'sa-choices', A);
+      q.options.forEach((o, i) => {
+        const b = h('button', 'sa-choice' + (it.choice === i ? ' is-selected' : ''), box);
+        h('span', 'sa-choice-letter', b, String.fromCharCode(65 + i));
+        renderRich(h('span', 'sa-choice-text', b), o.tex);
+        b.addEventListener('click', () => { it.choice = it.choice === i ? null : i; [...box.children].forEach((el, k) => el.classList.toggle('is-selected', k === it.choice)); this.refreshExamNav(); });
+      });
+    } else {
+      const row = h('div', 'sa-answer-row', A);
+      h('label', 'sa-answer-label', row, q.type === 'set' ? 'Values' : 'Final answer');
+      const inp = h('input', 'sa-input', row);
+      Object.assign(inp, { type: 'text', value: it.text || '', spellcheck: false });
+      inp.setAttribute('autocomplete', 'off'); inp.setAttribute('autocapitalize', 'off');
+      const prev = h('div', 'sa-preview', A);
+      const upd = () => {
+        it.text = inp.value;
+        prev.innerHTML = ''; prev.classList.remove('is-error');
+        const t = inp.value.trim();
+        if (!t) h('span', 'sa-muted', prev, 'Answer preview');
+        else { try { prev.appendChild(mathEl(examRead(q, t).tex, false)); flushMath(); } catch (e) { prev.classList.add('is-error'); prev.textContent = e instanceof ParseError ? e.message : 'Could not read that answer'; } }
+        this.refreshExamNav();
+      };
+      inp.addEventListener('input', upd);
+      inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); this.gotoExam(X.i + 1); } });
+      this.exInput = inp;
+      upd();
+    }
+    this.exPos.textContent = `Question ${X.i + 1} of ${X.items.length}`;
+    this.exPrev.disabled = X.i === 0;
+    this.exNext.disabled = X.i === X.items.length - 1;
+    this.refreshExamNav();
+    flushMath();
+    this.contentEl.scrollTop = 0;
+  },
+
+  refreshExamNav() {
+    const X = this.exam;
+    if (!X || !this.exNav) return;
+    const answered = (it) => (it.q.type === 'choice' ? it.choice != null : !!(it.text || '').trim());
+    [...this.exNav.children].forEach((b, k) => {
+      const it = X.items[k];
+      b.classList.toggle('is-current', k === X.i);
+      b.classList.toggle('is-answered', answered(it));
+      b.classList.toggle('is-flagged', it.flagged);
+    });
+    const left = X.items.filter((it) => !answered(it)).length;
+    this.exFlag.querySelector('.sa-btn-label').textContent = X.items[X.i].flagged ? 'Unflag' : 'Flag for review';
+    this.exSubmit.querySelector('.sa-btn-label').textContent = X.submitArmed ? `Submit with ${left} blank?` : 'Submit test';
+  },
+
+  tickExam() {
+    const X = this.exam;
+    if (!X || X.state !== 'running' || !this.exClock) return;
+    const used = (Date.now() - X.started) / 1000;
+    if (X.limit) {
+      const left = X.limit - used;
+      this.exClock.textContent = `${fmtClock(left)} left`;
+      this.exClock.classList.toggle('is-hot', left < 300);
+      if (left <= 0) { new Notice("Time's up: your test was submitted."); this.submitExam(); }
+    } else this.exClock.textContent = `${fmtClock(used)} elapsed`;
+  },
+
+  trySubmitExam() {
+    const X = this.exam;
+    this.stashExam();
+    const blank = X.items.filter((it) => (it.q.type === 'choice' ? it.choice == null : !(it.text || '').trim())).length;
+    if (blank && !X.submitArmed) { X.submitArmed = true; this.refreshExamNav(); return; }
+    this.submitExam();
+  },
+
+  /* ---------- marking ---------- */
+  async submitExam() {
+    const X = this.exam;
+    if (!X || X.state !== 'running') return;
+    this.stashExam();
+    if (this.examTimer) { clearInterval(this.examTimer); this.examTimer = null; }
+    X.state = 'done';
+    X.seconds = Math.round((Date.now() - X.started) / 1000);
+    let got = 0, total = 0;
+    for (const it of X.items) { it.result = gradeItem(it); total += it.q.points; if (it.result.correct) got += it.q.points; }
+    X.got = got; X.total = total; X.pct = Math.round((100 * got) / Math.max(1, total));
+    const m = obsidian.moment ? obsidian.moment() : null;
+    const hist = this.data.examHistory || (this.data.examHistory = []);
+    hist.push({ course: X.course, date: m ? m.format('YYYY-MM-DD HH:mm') : new Date().toISOString().slice(0, 16).replace('T', ' '), n: X.items.length, level: X.level, secs: X.secIds, got, total, pct: X.pct, seconds: X.seconds });
+    if (hist.length > 60) hist.splice(0, hist.length - 60);
+    for (const it of X.items) { const st = this.statFor(it.q.topic.id); if (it.result.correct) st.right += 1; else st.wrong += 1; }
+    await this.plugin.save();
+    this.renderExamResults();
+  },
+
+  renderExamResults() {
+    const X = this.exam, E = this.examEl;
+    E.innerHTML = '';
+    const wrap = h('div', 'sa-exam-results', E);
+    const top = h('div', 'sa-card sa-exam-score', wrap);
+    const big = h('div', 'sa-exam-big' + (X.pct >= 80 ? ' is-good' : X.pct < 50 ? ' is-low' : ''), top);
+    h('div', 'sa-exam-pct', big, `${X.pct}%`);
+    h('div', 'sa-exam-marks', big, `${X.got} / ${X.total} marks`);
+    const right = X.items.filter((it) => it.result.correct).length, blank = X.items.filter((it) => it.result.blank).length;
+    const side = h('div', 'sa-exam-score-side', top);
+    h('div', 'sa-exam-score-line', side, `${right} of ${X.items.length} questions correct${blank ? ` · ${blank} left blank` : ''}`);
+    h('div', 'sa-exam-score-line sa-muted', side, `${EXAM_LEVELS.find((l) => l.id === X.level).name} · ${fmtClock(X.seconds)} taken${X.limit ? ` of ${X.limit / 60} min` : ''}`);
+    const acts = h('div', 'sa-actions', side);
+    this.button(acts, 'New test, same settings', () => this.startExam(X.secIds, this.examPrefs()), 'mod-cta', 'refresh-cw');
+    this.button(acts, 'Change settings', () => { this.exam = null; this.renderExamSetup(); }, 'sa-ghost', 'sliders-horizontal');
+    const saveBtn = this.button(acts, 'Save to vault', async () => { saveBtn.disabled = true; await this.saveExam(); }, 'sa-ghost', 'save');
+
+    // by lecture
+    const bySec = h('div', 'sa-card sa-exam-bysec', wrap);
+    h('div', 'sa-exam-label', bySec, 'By lecture');
+    for (const s of SECTIONS.filter((x) => X.items.some((it) => it.q.examSec === x.id))) {
+      const its = X.items.filter((it) => it.q.examSec === s.id);
+      const g = its.reduce((a, it) => a + (it.result.correct ? it.q.points : 0), 0), t = its.reduce((a, it) => a + it.q.points, 0);
+      const row = h('div', 'sa-exam-secrow', bySec);
+      const name = h('button', 'sa-linkbtn sa-exam-secname', row, `${s.num} ${s.title}`);
+      name.addEventListener('click', () => this.openLearn(s.id));
+      const barEl = h('div', 'sa-bar', row);
+      const fill = h('div', 'sa-bar-fill', barEl);
+      fill.style.width = `${(100 * g) / Math.max(1, t)}%`;
+      if (g < t / 2) fill.classList.add('is-low');
+      h('span', 'sa-exam-secscore', row, `${g}/${t}`);
+    }
+    const weak = SECTIONS.filter((x) => { const its = X.items.filter((it) => it.q.examSec === x.id); return its.length && its.some((it) => !it.result.correct); });
+    if (weak.length) h('div', 'sa-exam-desc sa-exam-review', bySec, `Review: ${weak.map((s) => s.num).join(', ')}. Click a lecture to open its lesson.`);
+
+    // every question with its solution
+    const sol = h('div', 'sa-exam-solutions', wrap);
+    X.items.forEach((it, k) => this.renderExamSolution(sol, it, k));
+    flushMath();
+    this.contentEl.scrollTop = 0;
+  },
+
+  renderExamSolution(parent, it, k) {
+    const q = it.q, res = it.result;
+    VAR_TEX_Q = q.varTex || null;
+    const card = h('div', 'sa-card sa-exam-sol ' + (res.correct ? 'is-right' : 'is-wrong'), parent);
+    const head = h('div', 'sa-exam-sol-head', card);
+    h('span', 'sa-exam-sol-num', head, `Q${k + 1}`);
+    h('span', 'sa-exam-sol-verdict', head, res.correct ? 'Correct' : res.blank ? 'Not answered' : res.unreadable ? "Couldn't read your answer" : 'Incorrect');
+    h('span', 'sa-tag sa-tag-soft', head, q.topic.name);
+    h('span', 'sa-exam-sol-marks', head, `${res.correct ? q.points : 0}/${q.points}`);
+    renderRich(h('div', 'sa-prompt', card), q.prompt);
+    if (q.figure) { try { makeWidget(card, q.figure); } catch (e) { /* ignore */ } }
+    const cmp = h('div', 'sa-compare', card);
+    if (!res.blank) {
+      const y = h('div', 'sa-cmp ' + (res.correct ? 'is-right' : 'is-wrong'), cmp);
+      h('div', 'sa-cmp-label', y, q.type === 'choice' ? 'Your choice' : 'Your answer');
+      const box = h('div', 'sa-cmp-math', y);
+      if (res.userRich != null) renderRich(box, res.userRich); else if (res.userTex) box.appendChild(mathEl(res.userTex, false)); else box.textContent = res.userText || '';
+    }
+    if (!res.correct) {
+      const c = h('div', 'sa-cmp is-right', cmp);
+      h('div', 'sa-cmp-label', c, 'Correct answer');
+      const box = h('div', 'sa-cmp-math', c);
+      if (q.type === 'choice') renderRich(box, q.answerTex); else box.appendChild(mathEl(q.answerTex, false));
+    }
+    const bad = res.mistake ? res.mistake.stepIndex : -1;
+    if (!res.correct && (res.mistake || res.generic)) {
+      const d = h('div', 'sa-diag', card);
+      const st = q.steps[bad];
+      h('div', 'sa-diag-title', d, res.mistake ? (st ? `Where it went wrong: step ${bad + 1}, ${st.title}` : 'Where it went wrong') : 'What your answer tells us');
+      renderRich(h('div', 'sa-diag-body', d), res.mistake ? res.mistake.why : res.generic);
+    }
+    const wrapS = h('details', 'sa-steps-wrap', card);
+    if (!res.correct) wrapS.open = true;
+    h('summary', 'sa-steps-summary', wrapS, 'Worked solution');
+    const ol = h('ol', 'sa-steps', wrapS);
+    q.steps.forEach((s, i) => {
+      const li = h('li', 'sa-step ' + (bad >= 0 ? (i < bad ? 'is-ok' : i === bad ? 'is-bad' : 'is-next') : ''), ol);
+      const hd = h('div', 'sa-step-head', li);
+      h('span', 'sa-step-num', hd, String(i + 1));
+      h('span', 'sa-step-title', hd, s.title);
+      renderRich(h('div', 'sa-step-body', li), s.body);
+    });
+    if (it.strokes && it.strokes.length) {
+      const det = h('details', 'sa-steps-wrap', card);
+      h('summary', 'sa-steps-summary', det, 'Your working');
+      const holder = h('div', 'sa-exam-work', det);
+      det.addEventListener('toggle', () => {
+        if (!det.open || holder.dataset.done) return;
+        holder.dataset.done = '1';
+        holder.style.pointerEvents = 'none';
+        const b = new Board(holder, { scrollEl: this.contentEl, penOnly: () => true });
+        let maxY = 0; for (const st of it.strokes) for (const pt of st.pts) maxY = Math.max(maxY, pt[1]);
+        b.height = Math.max(200, Math.ceil(maxY + 40)); b.strokes = it.strokes.slice(); b.resize();
+      }, { once: false });
+    }
+  },
+
+  async saveExam() {
+    const X = this.exam;
+    try {
+      const vault = this.app.vault;
+      const folder = obsidian.normalizePath(`${this.data.folder || 'Study Arena'}/Exams`);
+      await ensureFolder(vault, folder);
+      const m = obsidian.moment ? obsidian.moment() : null;
+      const stamp = m ? m.format('YYYY-MM-DD HHmm') : new Date().toISOString().slice(0, 16).replace('T', ' ').replace(':', '');
+      let base = `${stamp} ${X.course} test`, n = 1;
+      while (vault.getAbstractFileByPath(`${folder}/${base}.md`)) base = `${stamp} ${X.course} test ${++n}`;
+      const asMd = (tex, rich) => (rich != null ? rich : `$${tex}$`);
+      const L = ['---', `course: ${X.course}`, `score: ${X.got}/${X.total}`, `percent: ${X.pct}`, `difficulty: ${X.level}`, `time: "${fmtClock(X.seconds)}"`, 'tags: [study-arena, exam]', '---', `# ${X.course} practice test: ${X.pct}%`, '', `**${X.got} / ${X.total} marks** · ${X.items.filter((it) => it.result.correct).length} of ${X.items.length} correct · ${fmtClock(X.seconds)}`, ''];
+      L.push('| Lecture | Marks |', '|---|---|');
+      for (const s of SECTIONS.filter((x) => X.items.some((it) => it.q.examSec === x.id))) {
+        const its = X.items.filter((it) => it.q.examSec === s.id);
+        L.push(`| ${s.num} ${s.title} | ${its.reduce((a, it) => a + (it.result.correct ? it.q.points : 0), 0)}/${its.reduce((a, it) => a + it.q.points, 0)} |`);
+      }
+      L.push('');
+      X.items.forEach((it, k) => {
+        const q = it.q, r = it.result;
+        L.push(`## Q${k + 1} · ${q.topic.name} (${r.correct ? q.points : 0}/${q.points}) ${r.correct ? '✅' : '❌'}`, '', q.prompt.replace(/<br>/g, '  \n'), '');
+        if (!r.blank) L.push(`**My answer:** ${r.userRich != null ? r.userRich : r.userTex ? `$${r.userTex}$` : r.userText || ''}`, '');
+        L.push(`**Correct answer:** ${asMd(q.answerTex, q.type === 'choice' ? q.answerTex : null)}`, '');
+        if (!r.correct && r.mistake) { const st = q.steps[r.mistake.stepIndex]; L.push(`> [!warning] Where it went wrong${st ? `: step ${r.mistake.stepIndex + 1}, ${st.title}` : ''}`, `> ${r.mistake.why}`, ''); }
+        L.push('**Worked solution**');
+        q.steps.forEach((s, i) => L.push(`${i + 1}. **${s.title}**: ${s.body.replace(/<br>/g, ' ')}`));
+        L.push('');
+      });
+      await vault.create(`${folder}/${base}.md`, L.join('\n'));
+      new Notice(`Saved "${base}"`);
+    } catch (e) {
+      console.error('Study Arena exam save', e);
+      new Notice('Could not save the test to the vault.');
+    }
+  },
+};
+
+/* ================================================================== */
 /* The view                                                            */
 /* ================================================================== */
 function h(tag, cls, parent, text) {
@@ -3290,7 +3788,7 @@ class StudyView extends ItemView {
     this.build();
     this.newQuestion();
   }
-  async onClose() { if (this.board) this.board.destroy(); }
+  async onClose() { if (this.board) this.board.destroy(); if (this.exBoard) this.exBoard.destroy(); if (this.examTimer) clearInterval(this.examTimer); }
 
   get data() { return this.plugin.data; }
 
@@ -3334,6 +3832,8 @@ class StudyView extends ItemView {
     const tabs = h('div', 'sa-tabs', top);
     this.tabPractice = h('button', 'sa-tab', tabs, 'Practice');
     this.tabLearn = h('button', 'sa-tab', tabs, 'Learn');
+    this.tabExam = h('button', 'sa-tab', tabs, 'Exam');
+    this.tabExam.addEventListener('click', () => this.openExam());
     this.tabPractice.addEventListener('click', () => this.setMode('practice', true));
     this.tabLearn.addEventListener('click', () => this.openLearn(this.data.lastSectionBy[this.data.course]));
     this.scoreEl = h('div', 'sa-pill sa-score', top);
@@ -3398,17 +3898,23 @@ class StudyView extends ItemView {
     this.learnEl = h('div', 'sa-learn', root);
     this.learnEl.hidden = true;
 
+    /* exam */
+    this.examEl = h('div', 'sa-exam', root);
+    this.examEl.hidden = true;
+
     this.refreshScore();
     this.refreshTools();
     this.setMode('practice', false);
   }
 
   async setCourse(c) {
+    if (this.exam && this.exam.state === 'running') { this.courseSel.value = this.data.course; new Notice('Finish or submit the test before switching course.'); return; }
     this.data.course = c;
     this.focus = null;
     await this.plugin.save();
     this.panel.hidden = true;
     if (this.mode === 'learn') this.openLearn(this.data.lastSectionBy[c]);
+    if (this.mode === 'exam') { this.exam = null; this.renderExamSetup(); }
     this.newQuestion();
   }
 
@@ -3417,6 +3923,8 @@ class StudyView extends ItemView {
     if (mode === 'practice' && clearFocus && this.focus) { this.focus = null; this.newQuestion(); }
     this.practiceEl.hidden = mode !== 'practice';
     this.learnEl.hidden = mode !== 'learn';
+    this.examEl.hidden = mode !== 'exam';
+    this.tabExam.classList.toggle('is-active', mode === 'exam');
     this.tabPractice.classList.toggle('is-active', mode === 'practice');
     this.tabLearn.classList.toggle('is-active', mode === 'learn');
     this.topicsBtn.hidden = mode !== 'practice';
@@ -4139,6 +4647,8 @@ async function ensureFolder(vault, path) {
 /* ================================================================== */
 /* Plugin + settings                                                   */
 /* ================================================================== */
+Object.assign(StudyView.prototype, ExamMixin);
+
 const DEFAULTS = {
   points: 0, streak: 0, bestStreak: 0, stats: {}, mastery: {}, lessonPos: {},
   selected: null,
@@ -4293,4 +4803,4 @@ class StudySettingTab extends PluginSettingTab {
 
 module.exports = StudyArenaPlugin;
 // exposed for testing
-module.exports.__engine = { cmpVersion, parse, evaluate, toTex, diagnose, diagnoseSet, makeQuestion, TOPICS, SECTIONS, CHAPTERS, COURSES, valuesAt, sameValues, sameSet, parseSet, loadCourseSource, lessonBeats, SA_API, makeWidget, renderRich, MASTERY_STREAK };
+module.exports.__engine = { buildExam, gradeItem, examRead, cmpVersion, parse, evaluate, toTex, diagnose, diagnoseSet, makeQuestion, TOPICS, SECTIONS, CHAPTERS, COURSES, valuesAt, sameValues, sameSet, parseSet, loadCourseSource, lessonBeats, SA_API, makeWidget, renderRich, MASTERY_STREAK };

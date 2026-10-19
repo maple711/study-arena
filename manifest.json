@@ -1,7 +1,7 @@
 {
   "id": "study-arena",
   "name": "Study Arena",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "minAppVersion": "1.4.0",
   "description": "Pen-and-tablet study arena with interactive lessons for MATH 3705, SYSC 3600, ECOR 3800, MAAE 3202, MAAE 3300, plus winter previews of MAAE 3004, MAAE 3500, MECH 3700 and MAAE 3400. Add subjects as course modules.",
   "author": "Alexandre",

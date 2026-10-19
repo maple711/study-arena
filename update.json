@@ -1,6 +1,6 @@
 {
-  "version": "1.6.0",
-  "notes": "One-tap updates from GitHub (Settings → Study Arena → Update now).",
+  "version": "1.7.0",
+  "notes": "Exam mode: build a timed practice test from chosen lectures, get a mark and full solutions.",
   "files": [
     "manifest.json",
     "main.js",
